@@ -1,0 +1,72 @@
+# Production compose — SPEC.md §11.2.
+#
+# No postgres service: production uses managed PostgreSQL reached via DATABASE_URL.
+# Only nginx exposes host ports; backend/frontend/redis are reachable only on the
+# internal Compose network.
+#
+# Bring up:
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Initial TLS bootstrap — see scripts/init_letsencrypt.sh.
+
+services:
+  nginx:
+    image: nginx:1.24-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    depends_on:
+      - frontend
+      - backend
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: runner
+    expose:
+      - "3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=/api
+    env_file:
+      - .env.prod
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: prod
+    expose:
+      - "8000"
+    env_file:
+      - .env.prod
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    # noeviction (NOT allkeys-lru): Redis holds revocation (blacklist:{jti}), CSRF and
+    # rate-limit keys — evicting one silently un-revokes a token / breaks CSRF (tr-5rd7).
+    # Under noeviction, denyoom writes (SET/SETEX/INCR) fail on OOM; every request-path
+    # write is hardened to degrade gracefully (best-effort/cache fail open, chat idempotency
+    # 503s, leader stays follower). TTL'd keys still expire. maxmemory stays 512mb — size it
+    # to ~60-70% of the redis container's RAM for real prod load and monitor `used_memory`.
+    command: redis-server --maxmemory 512mb --maxmemory-policy noeviction
+    restart: unless-stopped
+
+volumes:
+  redis_data:

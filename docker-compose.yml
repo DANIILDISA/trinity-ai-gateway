@@ -1,0 +1,245 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    # Pinned to the host user namespace (tr-an0g.7). When the Docker daemon LATER enables
+    # userns-remap=default (so a sandbox-container escape lands as an unprivileged host
+    # uid, not host root), data services MUST stay on the host ns — otherwise their
+    # named-volume ownership (postgres uid 70, redis 999, …) is remapped out from under
+    # them and the DB can't read its own files. Inert no-op until the daemon enables
+    # remapping. NEVER pin the `sandbox` service to host (that would defeat the remap).
+    userns_mode: "host"
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: trinity
+      POSTGRES_PASSWORD: trinity
+      POSTGRES_DB: trinity
+      # Consumed by docker/init-databases.sh on first boot (documents intent).
+      POSTGRES_MULTIPLE_DATABASES: trinity,trinity_test
+    # Tuning for 1500+ concurrent users behind PgBouncer. max_connections is the
+    # hard ceiling all app workers + PgBouncer + admin share; the memory settings
+    # lift the alpine defaults (shared_buffers 128MB, work_mem 4MB).
+    # idle_in_transaction_session_timeout (60s) is a safety net: a session left
+    # idle inside a transaction — e.g. an orphaned/leaked connection holding row
+    # locks — is terminated, releasing its locks instead of wedging every later
+    # request that needs those rows (the tr-dus incident). App transactions are
+    # short, so 60s never trips a healthy one. (tr-t6o)
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_buffers=256MB
+      -c work_mem=4MB
+      -c maintenance_work_mem=64MB
+      -c effective_cache_size=1GB
+      -c idle_in_transaction_session_timeout=60000
+    shm_size: 256mb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trinity -d trinity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    userns_mode: "host"  # keep host ns for named-volume ownership; see postgres (tr-an0g.7)
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Connection pooler (transaction mode). The backend opens many logical
+  # connections; PgBouncer multiplexes them onto a small set of real Postgres
+  # connections so worker count can scale without hitting max_connections.
+  pgbouncer:
+    image: pgbouncer/pgbouncer:latest
+    userns_mode: "host"  # keep host ns; see postgres (tr-an0g.7)
+    ports:
+      - "6432:6432"
+    volumes:
+      - ./backend/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./backend/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    # The image's default entrypoint auto-generates pgbouncer.ini from env vars
+    # and overwrites the mounted file. Bypass it and run the binary directly
+    # against our hand-written config.
+    entrypoint: ["/opt/pgbouncer/pgbouncer"]
+    command: ["/etc/pgbouncer/pgbouncer.ini"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    userns_mode: "host"  # keep host ns for the ./backend bind mount; see postgres (tr-an0g.7)
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file:
+      - .env
+    environment:
+      # App traffic goes through PgBouncer (overrides DATABASE_URL from .env).
+      DATABASE_URL: postgresql+asyncpg://trinity:trinity@pgbouncer:6432/trinity
+      # Migrations (Alembic) bypass PgBouncer and hit Postgres directly — see
+      # alembic/env.py and config.database_url_direct.
+      DATABASE_URL_DIRECT: postgresql+asyncpg://trinity:trinity@postgres:5432/trinity
+      # Pin the test suite to the isolated trinity_test DB so `pytest` inside the
+      # container can never corrupt dev data. Tests connect to Postgres directly,
+      # never through PgBouncer.
+      TEST_DATABASE_URL: postgresql+asyncpg://trinity:trinity@postgres:5432/trinity_test
+      # Sandbox code-execution service (epic tr-s3y1) — reached over the internal
+      # network only; never published to the host.
+      SANDBOX_URL: "http://sandbox:9000"
+    networks:
+      # Keep the implicit default network (internet for OpenRouter, plus
+      # postgres/redis/pgbouncer) AND join the internal sandbox network so the
+      # backend can reach the sandbox by hostname.
+      - default
+      - sandbox_internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+    restart: unless-stopped
+
+  # Code-execution sandbox (epic tr-s3y1, Phase 1). Runs untrusted Python in a
+  # locked-down container: NO internet (internal-only network), non-root,
+  # read-only rootfs, dropped capabilities, CPU/RAM/pids caps, tmpfs workspace.
+  # Holds no DB/Redis/secrets. Reachable ONLY by the backend over sandbox_internal
+  # (no host port).
+  sandbox:
+    build:
+      context: ./backend/sandbox
+    # A real init (PID 1) that reaps zombies — so any descendant a fork bomb
+    # double-forks out of the runner's process group can't pile up and exhaust
+    # pids_limit (the manager group-kills the rest).
+    init: true
+    networks:
+      - sandbox_internal
+    read_only: true
+    cap_drop:
+      - ALL
+    # The manager runs as container-root but keeps ONLY these (all else dropped):
+    # CHOWN+SETUID+SETGID to hand each per-execution workdir to a distinct child uid and
+    # drop the child to it; DAC_OVERRIDE+FOWNER so the root manager can read and rmtree
+    # those uid-owned 0700 workdirs (Phase 5 file I/O + cleanup; FOWNER also covers the
+    # sticky-bit case); KILL so the manager can os.killpg a runaway/fork-bomb child group
+    # — now that children run as a DISTINCT uid, same-uid signaling no longer applies and
+    # without CAP_KILL the SIGKILL is EPERM, leaking processes until pids_limit is hit.
+    # cap_drop ALL strips SETUID/SETGID/KILL, so without this re-add the child setuid drop
+    # fails EPERM and runaways can't be reaped (tr-an0g.7).
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+      - KILL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 768m
+    cpus: 1.0
+    tmpfs:
+      # Root-owned mode 0711 (NOT docker's tmpfs default 1777): a dropped child uid can
+      # traverse /workspace by name into its OWN 0700 workdir but CANNOT listdir it to
+      # enumerate sibling conversations' workdirs (tr-an0g.7). Only root (the manager)
+      # creates subdirs here. /tmp is root-only 0700 — children use a per-uid TMPDIR
+      # inside their workdir, so nothing falls back to a shared, cross-readable /tmp.
+      # 256m holds up to SANDBOX_MAX_KERNELS workdirs each with a seeded inputs/ + generated
+      # files + per-uid .tmp without ENOSPC (audit B2: 64m overflowed at 3-4 concurrent
+      # seeded kernels → silent upload loss). Caps below bound each workdir's footprint.
+      - /workspace:size=256m,mode=0711
+      - /tmp:size=16m,mode=0700
+    environment:
+      SANDBOX_WALL_SECONDS: "30"
+      SANDBOX_CPU_SECONDS: "30"
+      SANDBOX_MEM_BYTES: "536870912"
+      SANDBOX_OUTPUT_BYTES: "65536"
+      SANDBOX_WORKSPACE_ROOT: "/workspace"
+      # Global concurrency cap (tr-bzk0): runs beyond this get an immediate 503.
+      SANDBOX_MAX_CONCURRENT: "4"
+      # Persistent per-conversation kernels (tr-gbpc Ф3; tr-5ktl Ф4). The DS stack
+      # (numpy/pandas/matplotlib) lifts an active kernel's RSS to ~100MB baseline and
+      # far higher under heavy DataFrames/arrays, so memory — not count — is the
+      # binding constraint: cap residency at 4 AND evict free LRU kernels once the
+      # live set's summed RSS crosses ~600MB inside mem_limit 768m (RSS_EVICT_KB).
+      # Idle kernels evicted after IDLE_SECONDS; total CPU backstopped by
+      # KERNEL_CPU_SECONDS (per-exec time is the wall clock).
+      SANDBOX_MAX_KERNELS: "4"
+      SANDBOX_RSS_EVICT_KB: "614400"
+      SANDBOX_KERNEL_IDLE_SECONDS: "600"
+      SANDBOX_KERNEL_CPU_SECONDS: "120"
+      SANDBOX_RESULT_BYTES: "2097152"
+      # Phase 5 file byte caps (audit B2: pin them in prod, don't ride code defaults).
+      # Bound the shared 256m /workspace tmpfs across SANDBOX_MAX_KERNELS kernels: per-cell
+      # upload seed total, per generated-file size, per-cell generated-file total, file count.
+      SANDBOX_SEED_TOTAL_BYTES: "16777216"
+      SANDBOX_FILE_BYTES: "8388608"
+      SANDBOX_FILE_TOTAL_BYTES: "16777216"
+      SANDBOX_MAX_GENERATED_FILES: "32"
+      # Per-conversation uid isolation (tr-an0g.7): two DISJOINT uid pools so each
+      # sandboxed child drops to a distinct uid with a 0700 workdir → cross-tenant file
+      # reads fail EACCES. 60000-60031 = kernels, 60032-60039 = stateless runs. Must
+      # match the uid pool created in the sandbox Dockerfile. Unset → no drop (dev/tests).
+      SANDBOX_UID_POOL: "60000-60031"
+      SANDBOX_STATELESS_UID_POOL: "60032-60039"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: dev
+    userns_mode: "host"  # keep host ns for the ./frontend bind mount; see postgres (tr-an0g.7)
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_DEMO_MODE=${DEMO_MODE:-false}
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # One-shot dev-database seeder. Truncates user data (keeping schema +
+  # system_settings) and creates a single admin user. Not started by default —
+  # run explicitly:  docker compose --profile seed run --rm seed
+  seed:
+    profiles: ["seed"]
+    build: ./backend
+    command: python scripts/seed_dev.py
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+
+networks:
+  # The implicit default network (internet + inter-service) is kept as-is.
+  default:
+  # Internal-only: no gateway to the internet. The sandbox sits here alone so
+  # executed code has no network reach; the backend also joins it to talk to the
+  # sandbox by hostname.
+  sandbox_internal:
+    internal: true
+
+volumes:
+  postgres_data:
+  redis_data:

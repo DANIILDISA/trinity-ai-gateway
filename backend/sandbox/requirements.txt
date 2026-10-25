@@ -1,0 +1,12 @@
+# Sandbox service runtime (epic tr-s3y1, Phase 1) — deliberately minimal: this
+# image runs untrusted code and must carry NO DB/Redis/secret deps.
+fastapi==0.115.6
+uvicorn==0.34.0
+# dev/test — kept in the image so the suite runs in-container
+pytest==8.3.4
+httpx==0.28.1
+# Phase 4 (tr-5ktl): data-science layer for rich outputs. Stable ABIs; matplotlib
+# uses the headless Agg backend (no GUI deps). numpy<2 for the widest wheel ABI.
+numpy>=1.26,<2
+pandas>=2.2,<3
+matplotlib>=3.8,<4

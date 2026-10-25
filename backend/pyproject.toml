@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trinity-backend"
+version = "0.0.1"
+requires-python = ">=3.12"
+
+dependencies = [
+    "fastapi>=0.136",
+    "uvicorn[standard]>=0.34",
+    "uvicorn-worker>=0.2",
+    "gunicorn>=23.0",
+    "uvloop>=0.21; sys_platform != 'win32'",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "redis[hiredis]>=5.0",
+    "pydantic-settings>=2.6",
+    "email-validator>=2.0",
+    "pyjwt>=2.10",
+    "passlib[bcrypt]>=1.7",
+    "httpx>=0.28",
+    "tiktoken>=0.9",
+    "python-multipart>=0.0.20",
+    "jinja2>=3.1",
+    "psutil>=6.0",
+    "cryptography>=43.0",
+    "openai>=1.50",
+]
+
+[project.optional-dependencies]
+prod = []
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-env>=1.1",
+    "httpx>=0.28",
+    "pytest-cov>=6.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*", "sandbox*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests", "sandbox/tests"]
+# Default the test DB to the isolated trinity_test database for local (host)
+# runs. The `D:` prefix means "default" — pytest-env only applies it when
+# TEST_DATABASE_URL is not already set, so inside the Docker container the
+# compose-provided value (which uses the `postgres` host) still wins.
+env = [
+    "D:TEST_DATABASE_URL=postgresql+asyncpg://trinity:trinity@localhost:5432/trinity_test",
+]

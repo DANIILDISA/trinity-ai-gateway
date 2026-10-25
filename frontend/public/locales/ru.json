@@ -1,0 +1,37 @@
+{
+  "app": {
+    "name": "Trinity"
+  },
+  "auth": {
+    "login": "Войти",
+    "register": "Зарегистрироваться",
+    "logout": "Выйти",
+    "email": "Email",
+    "password": "Пароль",
+    "displayName": "Имя",
+    "forgotPassword": "Забыли пароль?",
+    "resetPassword": "Сбросить пароль",
+    "loginWithYandex": "Войти через Яндекс"
+  },
+  "errors": {
+    "authRequired": "Необходимо войти в аккаунт",
+    "authInvalid": "Неверный email или пароль",
+    "accountBlocked": "Аккаунт заблокирован",
+    "adminRequired": "Доступ запрещён",
+    "insufficientFunds": "Недостаточно средств",
+    "rateLimited": "Слишком много запросов. Попробуйте через {{seconds}} секунд",
+    "modelUnavailable": "Модель временно недоступна",
+    "internalError": "Внутренняя ошибка сервера"
+  },
+  "balance": {
+    "topUp": "Пополнить",
+    "history": "История операций",
+    "credit": "Пополнение",
+    "debit": "Списание"
+  },
+  "chat": {
+    "newChat": "Новый чат",
+    "send": "Отправить",
+    "placeholder": "Введите сообщение..."
+  }
+}
